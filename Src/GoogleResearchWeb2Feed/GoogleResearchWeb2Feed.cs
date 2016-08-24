@@ -9,24 +9,43 @@ using System.Security.Policy;
 using System.Text.RegularExpressions;
 using HtmlAgilityPack;
 using System.ServiceModel.Syndication;
+using System.Threading.Tasks;
 
 namespace GoogleResearchWeb2Feed
 {
-    class Program
+    public class GoogleResearchWeb2Feed
     {
-        private const string GrFqdn = "https://research.google.com";
-        private const string GrCrawlingRoot = "/pubs/papers.html";
+        private static readonly string GrFqdn = "https://research.google.com";
+        private static readonly string GrCrawlingRoot = "/pubs/papers.html";
 
         private static readonly Regex RegexArticldId = new Regex("/([a-zA-Z0-9]*).html$");
         private static readonly char[] TrimChars = new[] { '"', ' ', '\r', '\n' };
 
-        public static void Main(string[] args)
+        private static readonly int MaxItemsPerArea = 10;
+        private static readonly int MaxItemsPerFeed = 50;
+
+        private static TimeSpan _cacheTimeSpan;
+
+        private static  SyndicationFeed _resultLastSyndicationFeed;
+        private static DateTime _resultLastDateTimeUtc = DateTime.MinValue;
+
+        public GoogleResearchWeb2Feed(TimeSpan? cacheTimeSpan = null)
         {
-            var pubs = GetPubs();
-            var feed = GenerateFeed(pubs.Select(p => p.Value), GrFqdn);
+            _cacheTimeSpan = cacheTimeSpan ?? TimeSpan.FromHours(1);
         }
 
-        private static ConcurrentDictionary<string, Article> GetPubs()
+        public async Task<SyndicationFeed> GetFeed(bool useCache = true)
+        {
+            if (useCache != false && _resultLastSyndicationFeed != null && _resultLastDateTimeUtc + _cacheTimeSpan >= DateTime.UtcNow)
+                return _resultLastSyndicationFeed;
+
+            var pubs = await GetPubs();
+            _resultLastSyndicationFeed = await MakeFeed(pubs.Select(p => p.Value), GrFqdn);  // 2回とっても困りはしないので雑にキャッシュ
+            _resultLastDateTimeUtc = DateTime.UtcNow;
+            return _resultLastSyndicationFeed;
+        }
+
+        private static async Task<ConcurrentDictionary<string, Article>> GetPubs()
         {
             var pubs = new ConcurrentDictionary<string, Article>();
 
@@ -39,17 +58,20 @@ namespace GoogleResearchWeb2Feed
             {
                 var areaDoc = website.Load(area.OriginalString);
                 var nodes = areaDoc.DocumentNode.SelectNodes("//ul[contains(@class,'pub-list')]/li");
-                foreach (var node in nodes)
+                foreach (var item in nodes.Select((node, i) => new { node, i }))
                 {
-                    var a = GetArticles(node);
+                    var a = await GetArticles(item.node);
                     pubs.TryAdd(a.Id, a); // if the article duplicate, to skip.
+
+                    if (item.i == MaxItemsPerArea)
+                        break;
                 }
             }
 
             return pubs;
         }
 
-        private static Article GetArticles(HtmlNode node)
+        private static async Task<Article> GetArticles(HtmlNode node)
         {
             // has search icon ?
             var searchUrl = node.SelectNodes("./a[contains(@class,'search-icon')]")?.FirstOrDefault()?.Attributes["href"]?.Value;
@@ -86,14 +108,14 @@ namespace GoogleResearchWeb2Feed
             };
 
             if (article.Uri != null)
-                AddAbstract(article);
+                await AddAbstract(article);
             else
                 article.LastUpdateDateTime = DateTimeOffset.UtcNow;
 
             return article;
         }
 
-        private static async void AddAbstract(Article article)
+        private static async Task AddAbstract(Article article)
         {
             var httpClient = new HttpClient();
             var content = (await httpClient.GetAsync(article.Uri.OriginalString)).Content;
@@ -106,7 +128,7 @@ namespace GoogleResearchWeb2Feed
             article.Abstract = node?.InnerText?.Trim(TrimChars);
         }
 
-        private static SyndicationFeed GenerateFeed(IEnumerable<Article> articles, string feedId)
+        private static async Task<SyndicationFeed> MakeFeed(IEnumerable<Article> articles, string feedId)
         {
             var feed = new SyndicationFeed
             {
@@ -121,8 +143,6 @@ namespace GoogleResearchWeb2Feed
 
             var items = new List<SyndicationItem>();
 
-            const int maxItems = 20;
-
             foreach (var article in articles)
             {
                 // TODO: Fill the item content
@@ -130,16 +150,19 @@ namespace GoogleResearchWeb2Feed
 
                 var item = new SyndicationItem
                 {
-                    Id = article.Uri.OriginalString ?? article.Id,
+                    Id = article.Uri?.OriginalString ?? article.Id,
                     Title = new TextSyndicationContent(article.Title),
                     LastUpdatedTime = article.LastUpdateDateTime ?? DateTimeOffset.UtcNow,
                     PublishDate = article.LastUpdateDateTime ?? DateTimeOffset.UtcNow,
                     Content = new TextSyndicationContent(htmlContent, TextSyndicationContentKind.Html),
                 };
-                item.Links.Add(new SyndicationLink(article.Uri));
+
+                if(article.Uri != null)
+                    item.Links.Add(new SyndicationLink(article.Uri));
 
                 items.Add(item);
-                if (items.Count >= maxItems)
+
+                if (items.Count >= MaxItemsPerFeed)
                     break;
             }
 
